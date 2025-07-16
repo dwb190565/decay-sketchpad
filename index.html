@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Decay Sketchpad</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a; /* Dark initial background */
+            font-family: "Inter", sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            width: 100vw;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        .message-box {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            text-align: center;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s ease-in-out, visibility 0.3s ease-in-out;
+        }
+        .message-box.show {
+            opacity: 1;
+            visibility: visible;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="sketchpad"></canvas>
+    <div id="messageBox" class="message-box"></div>
+
+    <script>
+        // Global Three.js variables
+        let scene, camera, renderer;
+        // Array to hold all active particle objects
+        let particles = [];
+        // Geometry and material for Three.js Points
+        let particleGeometry, particleMaterial, particlePoints;
+
+        // Mouse/Touch state variables
+        let isDrawing = false;
+        let mouse = new THREE.Vector2();
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+        let mouseSpeed = 0;
+
+        // Background color variables (HSL hue)
+        let currentHue = 0.6; // Initial hue (blue-ish)
+        let targetHue = 0.6;
+        const hueLerpSpeed = 0.02; // Speed for background color transition
+
+        // Tone.js audio variables
+        let ambientSynth, clickSynth, melodySynth;
+        // Removed ambientPanner, clickPanner, melodyPanner as they were unused.
+        // Removed clickFilter, melodyFilter as they were unused.
+        let ambientFilter; // Kept as it's used for ambientSynth
+        let ambientReverb, clickReverb, melodyReverb;
+        let toneInitialized = false;
+
+        // Particle properties
+        const PARTICLE_LIFESPAN = 120; // Frames
+        const MAX_PARTICLES = 5000; // Limit for performance
+
+        // Message box element
+        let messageBox;
+
+        // Particle class definition
+        class Particle {
+            constructor(x, y, z, color, size, velocity) {
+                this.position = new THREE.Vector3(x, y, z);
+                this.velocity = velocity || new THREE.Vector3(
+                    (Math.random() - 0.5) * 0.05,
+                    (Math.random() - 0.5) * 0.05,
+                    (Math.random() - 0.5) * 0.05
+                );
+                this.color = color;
+                this.size = size;
+                this.life = PARTICLE_LIFESPAN; // Current life
+                this.maxLife = PARTICLE_LIFESPAN; // Total lifespan
+            }
+
+            // Update particle's position, life, and color
+            update() {
+                this.position.add(this.velocity);
+                this.life--;
+
+                // Decay velocity over time
+                this.velocity.multiplyScalar(0.98);
+
+                // Mutate color slightly
+                const hueShift = Math.sin(this.life * 0.1) * 0.005;
+                const saturationShift = Math.cos(this.life * 0.05) * 0.005;
+                const lightnessShift = Math.sin(this.life * 0.08) * 0.005;
+
+                const hsl = {};
+                this.color.getHSL(hsl);
+                this.color.setHSL(
+                    (hsl.h + hueShift + 1) % 1, // Ensure hue stays between 0-1
+                    Math.max(0, Math.min(1, hsl.s + saturationShift)),
+                    Math.max(0, Math.min(1, hsl.l + lightnessShift))
+                );
+
+                // Shrink particle over its life
+                this.size = (this.life / this.maxLife) * 0.05 + 0.001; // Ensure it doesn't become zero
+            }
+
+            // Check if particle is dead
+            isDead() {
+                return this.life <= 0;
+            }
+        }
+
+        // Initialize the Three.js scene, camera, and renderer
+        function init() {
+            messageBox = document.getElementById('messageBox');
+            const canvas = document.getElementById('sketchpad');
+
+            // Scene
+            scene = new THREE.Scene();
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 5;
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setClearColor(new THREE.Color().setHSL(currentHue, 0.5, 0.1), 1); // Initial dark background color
+
+            // Particle system setup
+            particleGeometry = new THREE.BufferGeometry();
+            particleMaterial = new THREE.PointsMaterial({
+                size: 0.05,
+                vertexColors: true, // Enable per-vertex colors
+                transparent: true,
+                blending: THREE.AdditiveBlending, // For glowing effect
+                sizeAttenuation: true // Particles closer to camera are larger
+            });
+            particlePoints = new THREE.Points(particleGeometry, particleMaterial);
+            scene.add(particlePoints);
+
+            // Event Listeners
+            window.addEventListener('resize', onWindowResize);
+            canvas.addEventListener('mousedown', onPointerDown);
+            canvas.addEventListener('mousemove', onPointerMove);
+            canvas.addEventListener('mouseup', onPointerUp);
+            canvas.addEventListener('mouseleave', onPointerUp); // Stop drawing if mouse leaves canvas
+
+            canvas.addEventListener('touchstart', onPointerDown, { passive: false });
+            canvas.addEventListener('touchmove', onPointerMove, { passive: false });
+            canvas.addEventListener('touchend', onPointerUp);
+            canvas.addEventListener('touchcancel', onPointerUp);
+
+            // Start the animation loop
+            animate();
+        }
+
+        // Handle window resizing
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Handle pointer down (mouse or touch)
+        async function onPointerDown(event) {
+            event.preventDefault(); // Prevent default touch behavior (e.g., scrolling)
+            isDrawing = true;
+            if (!toneInitialized) {
+                await initTone(); // Initialize Tone.js only on first interaction
+                toneInitialized = true;
+                showMessage("Click or drag to draw and make music!", 3000);
+            }
+            updateMousePosition(event);
+            lastMouseX = mouse.x;
+            lastMouseY = mouse.y;
+            // Trigger an initial sound only if clickSynth is defined
+            if (toneInitialized && clickSynth) {
+                clickSynth.triggerAttackRelease("C4", "8n");
+            }
+        }
+
+        // Handle pointer move (mouse or touch)
+        function onPointerMove(event) {
+            event.preventDefault(); // Prevent default touch behavior
+            if (isDrawing) {
+                const prevMouseX = mouse.x;
+                const prevMouseY = mouse.y;
+                updateMousePosition(event);
+
+                // Calculate mouse speed for background and sound intensity
+                const dx = mouse.x - prevMouseX;
+                const dy = mouse.y - prevMouseY;
+                mouseSpeed = Math.sqrt(dx * dx + dy * dy);
+
+                // Add particles based on mouse movement
+                addParticles(mouse.x, mouse.y);
+
+                // Adjust target hue based on mouse speed
+                targetHue = (targetHue + mouseSpeed * 0.05) % 1; // Cycle hue based on speed
+
+                // Trigger sounds based on drawing, ensuring synths are initialized
+                if (toneInitialized && ambientSynth && clickSynth && melodySynth) {
+                    // Ambient drone pitch based on Y position
+                    // ambientSynth is now a Tone.Synth, so it has a direct 'frequency' property
+                    ambientSynth.frequency.value = 200 + (mouse.y + 1) * 100;
+                    // Click sound frequency/volume based on speed
+                    if (mouseSpeed > 0.005) { // Only trigger if there's significant movement
+                        clickSynth.triggerAttackRelease(
+                            `C${Math.floor(4 + mouseSpeed * 10)}`, // Higher pitch for faster movement
+                            "32n",
+                            Tone.now(),
+                            Math.min(1, mouseSpeed * 50) // Louder for faster movement
+                        );
+                    }
+                    // Melody fragments based on X position
+                    if (Math.abs(dx) > 0.01) { // Trigger melody on horizontal movement
+                        const notes = ["C4", "D4", "E4", "G4", "A4", "C5"];
+                        const note = notes[Math.floor((mouse.x + 1) * notes.length / 2)];
+                        melodySynth.triggerAttackRelease(note, "16n", Tone.now(), 0.5);
+                    }
+                }
+            }
+        }
+
+        // Handle pointer up (mouse or touch)
+        function onPointerUp() {
+            isDrawing = false;
+            mouseSpeed = 0; // Reset speed when drawing stops
+            if (toneInitialized && ambientSynth) { // Ensure Tone.js and ambientSynth are initialized
+                // Stop ambient drone when drawing stops
+                ambientSynth.triggerRelease();
+            }
+        }
+
+        // Update mouse coordinates to normalized device coordinates (-1 to 1)
+        function updateMousePosition(event) {
+            let clientX, clientY;
+            if (event.touches && event.touches.length > 0) {
+                clientX = event.touches[0].clientX;
+                clientY = event.touches[0].clientY;
+            } else {
+                clientX = event.clientX;
+                clientY = event.clientY;
+            }
+            mouse.x = (clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+        }
+
+        // Add new particles to the system
+        function addParticles(x, y) {
+            // Convert normalized device coordinates to world coordinates
+            const vector = new THREE.Vector3(x, y, 0.5); // Z can be slightly varied
+            vector.unproject(camera);
+
+            // Add multiple particles per frame for a denser stroke
+            const numParticlesToAdd = Math.floor(mouseSpeed * 100) + 1; // More particles for faster movement
+
+            for (let i = 0; i < numParticlesToAdd; i++) {
+                if (particles.length >= MAX_PARTICLES) {
+                    // Remove oldest particle if max limit is reached
+                    particles.shift();
+                }
+
+                // Randomize initial position slightly around the mouse pointer
+                const randomOffset = new THREE.Vector3(
+                    (Math.random() - 0.5) * 0.1,
+                    (Math.random() - 0.5) * 0.1,
+                    (Math.random() - 0.5) * 0.1
+                );
+                const particlePos = vector.clone().add(randomOffset);
+
+                // Randomize initial velocity
+                const initialVelocity = new THREE.Vector3(
+                    (Math.random() - 0.5) * 0.05,
+                    (Math.random() - 0.5) * 0.05,
+                    (Math.random() - 0.5) * 0.05
+                );
+
+                // Use the current background hue for particle color
+                const particleColor = new THREE.Color().setHSL(currentHue, 0.8, 0.7);
+
+                // Add new particle
+                particles.push(new Particle(
+                    particlePos.x,
+                    particlePos.y,
+                    particlePos.z,
+                    particleColor,
+                    0.05, // Initial size
+                    initialVelocity
+                ));
+            }
+        }
+
+        // Update particle positions and attributes in the BufferGeometry
+        function updateParticleGeometry() {
+            const positions = new Float32Array(particles.length * 3);
+            const colors = new Float32Array(particles.length * 3);
+            const sizes = new Float32Array(particles.length);
+
+            let pIndex = 0;
+            let cIndex = 0;
+            let sIndex = 0;
+
+            // Filter out dead particles and update living ones
+            particles = particles.filter(p => {
+                p.update();
+                if (!p.isDead()) {
+                    positions[pIndex++] = p.position.x;
+                    positions[pIndex++] = p.position.y;
+                    positions[pIndex++] = p.position.z;
+
+                    colors[cIndex++] = p.color.r;
+                    colors[cIndex++] = p.color.g;
+                    colors[cIndex++] = p.color.b;
+
+                    sizes[sIndex++] = p.size;
+                    return true;
+                }
+                return false;
+            });
+
+            // Update BufferGeometry attributes
+            particleGeometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(0, pIndex), 3));
+            particleGeometry.setAttribute('color', new THREE.BufferAttribute(colors.slice(0, cIndex), 3));
+            particleGeometry.setAttribute('size', new THREE.BufferAttribute(sizes.slice(0, sIndex), 1)); // Custom attribute for size
+            particleGeometry.attributes.position.needsUpdate = true;
+            particleGeometry.attributes.color.needsUpdate = true;
+            if (particleMaterial.sizeAttenuation) {
+                // If sizeAttenuation is true, the size attribute is used by the shader
+                particleMaterial.size = 1; // Base size, actual size comes from vertex attribute
+            } else {
+                particleMaterial.size = 0.05; // Fixed size if not attenuated
+            }
+        }
+
+        // Main animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Update particles and their geometry
+            updateParticleGeometry();
+
+            // Lerp background hue towards target hue
+            currentHue = THREE.MathUtils.lerp(currentHue, targetHue, hueLerpSpeed);
+            renderer.setClearColor(new THREE.Color().setHSL(currentHue, 0.5, 0.1), 1);
+
+            // Render the scene
+            renderer.render(scene, camera);
+        }
+
+        // Initialize Tone.js audio context and synths
+        async function initTone() {
+            await Tone.start();
+            console.log("Tone.js context started.");
+
+            // Ambient Synth (Pad-like)
+            // Changed from PolySynth to a simple Synth for direct frequency control
+            ambientSynth = new Tone.Synth({
+                oscillator: { type: "sine" },
+                envelope: {
+                    attack: 2,
+                    decay: 1,
+                    sustain: 0.5,
+                    release: 5
+                },
+                volume: -15 // Start quiet
+            }).toDestination();
+            ambientFilter = new Tone.Filter(400, "lowpass").toDestination();
+            ambientReverb = new Tone.Reverb({ decay: 5, preDelay: 0.1 }).toDestination();
+            ambientSynth.connect(ambientFilter);
+            ambientFilter.connect(ambientReverb);
+            ambientSynth.triggerAttack("C3"); // Start a continuous drone
+
+            // Click Synth (Rhythmic)
+            clickSynth = new Tone.MembraneSynth({
+                pitchDecay: 0.05,
+                octaves: 8,
+                envelope: {
+                    attack: 0.001,
+                    decay: 0.4,
+                    sustain: 0.01,
+                    release: 0.8,
+                    attackCurve: "exponential"
+                },
+                volume: -10
+            }).toDestination();
+            clickReverb = new Tone.Reverb({ decay: 2, preDelay: 0.05 }).toDestination();
+            clickSynth.connect(clickReverb);
+
+            // Melody Synth (Simple FM for melodic fragments)
+            melodySynth = new Tone.FMSynth({
+                harmonicity: 3,
+                modulationIndex: 10,
+                oscillator: { type: "sine" },
+                envelope: {
+                    attack: 0.01,
+                    decay: 0.2,
+                    sustain: 0.05,
+                    release: 1
+                },
+                modulation: { type: "square" },
+                modulationEnvelope: {
+                    attack: 0.05,
+                    decay: 0.1,
+                    sustain: 0.0,
+                    release: 0.05
+                },
+                volume: -12
+            }).toDestination();
+            melodyReverb = new Tone.Reverb({ decay: 3, preDelay: 0.08 }).toDestination();
+            melodySynth.connect(melodyReverb);
+        }
+
+        // Function to show a message box
+        function showMessage(message, duration = 0) {
+            messageBox.textContent = message;
+            messageBox.classList.add('show');
+            if (duration > 0) {
+                setTimeout(() => {
+                    messageBox.classList.remove('show');
+                }, duration);
+            }
+        }
+
+        // Initialize the sketchpad when the window loads
+        window.onload = function () {
+            init();
+            showMessage("Welcome to Decay Sketchpad! Click anywhere to start.", 5000);
+        };
+
+    </script>
+</body>
+</html>
